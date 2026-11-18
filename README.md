@@ -205,3 +205,36 @@ This grading code is licensed under the [Apache License 2.0](LICENSE).
 The FrontierFinance rubrics dataset it operates on is licensed separately under
 [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) and is not covered by
 this repository's license. See [NOTICE](NOTICE) for details.
+
+## Harbor parity (fork only)
+
+This fork adds `harbor_parity/` for the parity experiment of the
+[Harbor FrontierFinance adapter](https://github.com/harbor-index/adapters/tree/main/src/frontier-finance).
+The grader is unchanged at `8b71342`. Upstream ships no agent, so the original
+side runs `claude-code` outside Harbor with the same version, model, flags,
+environment variables, instruction text and time limit as Harbor's
+`claude-code` agent.
+
+- `harbor_parity/Dockerfile` mirrors the Harbor task image and installs a pinned
+  `claude-code`.
+- `harbor_parity/run_claude_code.py run` reads the Harbor-generated tasks, runs one
+  fresh container per query (local Docker, or a Modal sandbox with `--backend modal`)
+  with the task's CPU, memory and time limits and the instruction on stdin, and keeps
+  `/app/report.md`, the `stream-json` log and the session files. Rerunning skips
+  queries with a final status.
+- `harbor_parity/run_claude_code.py collect` counts statuses for an original run
+  or a Harbor job and writes `system_summaries.json`.
+
+```bash
+export ANTHROPIC_API_KEY=...            # and ANTHROPIC_BASE_URL for a gateway
+python harbor_parity/run_claude_code.py run -d <adapters>/datasets/frontier-finance \
+    -o runs/original1 -m <model> --claude-code-version <version> -n 8
+python harbor_parity/run_claude_code.py collect runs/original1 \
+    --summaries runs/original1/system_summaries.json
+# set responses_path in eval.example.yaml to the summaries, then:
+uv run frontier-finance-grader --config eval.example.yaml
+```
+
+The Harbor side runs `run_frontier-finance_parity.yaml` from the adapter with
+the same model and version. `collect jobs/<job> --summaries ...` exports its
+reports so they can be cross-graded here.
