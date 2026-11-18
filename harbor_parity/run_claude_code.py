@@ -1,14 +1,18 @@
 """Original side of Harbor parity for FrontierFinance: claude-code outside Harbor.
 
-  run      Run claude-code once per query in a fresh container built from
-           harbor_parity/Dockerfile, on local Docker or in a Modal sandbox
-           (--backend), with the same instruction text, model, claude-code
-           version, flags, environment, resources and time limit as Harbor's
-           claude-code agent. Rerunning the same command skips queries that
-           already have a final status and retries the rest.
-  collect  Count runs by status and write system_summaries.json for the grader.
-           Reads an original-side run directory or a Harbor job directory, so
-           both sides are counted, and the Harbor side can be cross-graded here.
+  run      Run claude-code once per query in a fresh container, on local Docker
+           or in a Modal sandbox (--backend). The image is the task's own
+           environment/Dockerfile plus the install step Harbor's claude-code
+           agent runs; the instruction text, model, claude-code version, flags,
+           environment, resources and time limit are Harbor's too. Rerunning the
+           same command skips queries that already have a final status and
+           retries the rest.
+  collect  Apply one rerun rule to either side and write system_summaries.json
+           for the grader. Takes an original-side run directory or Harbor job
+           directories (a job, then rerun jobs: later trials replace earlier ones).
+           --chunk splits the summaries so a grading failure loses one chunk.
+  score    Merge the grader's per_item.json files (later files replace earlier
+           queries) into the macro qualification rate, and list queries to regrade.
 
 Usage (from the repository root). ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN for a
 bearer-auth gateway, and an optional ANTHROPIC_BASE_URL come from the environment;
@@ -17,10 +21,11 @@ bearer-auth gateway, and an optional ANTHROPIC_BASE_URL come from the environmen
   python harbor_parity/run_claude_code.py run -d <harbor>/datasets/frontier-finance \\
       -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.326 -n 8
   python harbor_parity/run_claude_code.py collect runs/original1 \\
-      --summaries runs/original1/system_summaries.json
+      --summaries runs/original1/summaries/part.json --chunk 20
 
-Then grade with this repository's grader and eval.example.yaml unchanged
-(responses_path -> the summaries).
+Then grade each chunk with this repository's grader and eval.example.yaml
+unchanged (responses_path -> the chunk, output_dir -> its own directory), and
+  python harbor_parity/run_claude_code.py score runs/original1/grades/*/per_item.json
 """
 
 from __future__ import annotations
@@ -40,11 +45,39 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-HERE = Path(__file__).parent
-# Statuses that are real results. Anything else (an API error, no result event)
-# is an infrastructure failure and is rerun on both sides.
+# The one rerun rule for both sides, read from claude-code's own stream log:
+# these statuses are results and are scored (0 without a report). Anything else
+# (an API error, error_during_execution, no result event) is an infrastructure
+# failure and is rerun.
 FINAL_STATUSES = frozenset({"success", "error_max_turns", "timeout"})
-ALIASES = ("OPUS", "SONNET", "HAIKU", "FABLE")
+# Set to the model when a base URL is set (harbor 0.26.0, claude_code.py _model_alias_env).
+ALIAS_VARS = (
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+)
+# Host variables Harbor's claude-code agent reads into its flags or environment.
+# Both sides run with them unset.
+HOST_OVERRIDES = (
+    "CLAUDE_CODE_MAX_TURNS",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+    "MAX_THINKING_TOKENS",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
+    *ALIAS_VARS,
+)
+# Harbor's claude-code install step (ensure_system_dependencies, then bootstrap.sh),
+# appended to the task's environment/Dockerfile.
+INSTALL_LAYER = """
+RUN apt-get update && apt-get install -y --no-install-recommends curl bash nodejs npm procps \\
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://downloads.claude.ai/claude-code-releases/bootstrap.sh | bash -s -- {version} \\
+    && /root/.local/bin/claude --version
+ENV PATH="/root/.local/bin:$PATH"
+WORKDIR /app
+"""
 FORWARDED_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
 # Harbor's claude-code setup and run commands; the instruction arrives on stdin.
 AGENT_COMMAND = (
@@ -88,7 +121,7 @@ def agent_env(model: str) -> dict[str, str]:
         "CLAUDE_CONFIG_DIR": "/logs/agent/sessions",
     }
     if os.environ.get("ANTHROPIC_BASE_URL"):
-        env.update({f"ANTHROPIC_DEFAULT_{tier}_MODEL": model for tier in ALIASES})
+        env.update(dict.fromkeys(ALIAS_VARS, model))
     env.update({key: os.environ[key] for key in FORWARDED_KEYS if os.environ.get(key)})
     return env
 
@@ -115,21 +148,26 @@ def parse_status(log: Path) -> str:
 Backend = Callable[[Path, Task, dict[str, str]], tuple[int, bool]]
 
 
-def docker_backend(version: str) -> Backend:
-    image = f"ff-parity-claude-code:{version}"
-    subprocess.run(
-        [
-            "docker",
-            "build",
-            "-q",
-            "-t",
-            image,
-            "--build-arg",
-            f"CLAUDE_CODE_VERSION={version}",
-            str(HERE),
-        ],
-        check=True,
+def agent_image_dir(dataset: Path, version: str, out: Path) -> Path:
+    """Build context: the task environment (identical across tasks) plus INSTALL_LAYER."""
+    envs = {
+        (p / "environment" / "Dockerfile").read_text()
+        for p in dataset.iterdir()
+        if (p / "environment" / "Dockerfile").is_file()
+    }
+    if len(envs) != 1:
+        raise SystemExit(f"expected one task Dockerfile, found {len(envs)}")
+    context = out / "agent-image"
+    context.mkdir(parents=True, exist_ok=True)
+    (context / "Dockerfile").write_text(
+        envs.pop() + INSTALL_LAYER.format(version=version)
     )
+    return context
+
+
+def docker_backend(context: Path, version: str) -> Backend:
+    image = f"ff-parity-claude-code:{version}"
+    subprocess.run(["docker", "build", "-q", "-t", image, str(context)], check=True)
 
     def run(query_dir: Path, task: Task, env: dict[str, str]) -> tuple[int, bool]:
         name = f"ff-parity-{uuid.uuid4().hex[:12]}"
@@ -170,14 +208,10 @@ def docker_backend(version: str) -> Backend:
     return run
 
 
-def modal_backend(version: str) -> Backend:
+def modal_backend(context: Path, version: str) -> Backend:
     import modal
 
-    image = modal.Image.from_dockerfile(
-        HERE / "Dockerfile",
-        context_dir=HERE,
-        build_args={"CLAUDE_CODE_VERSION": version},
-    )
+    image = modal.Image.from_dockerfile(context / "Dockerfile", context_dir=context)
     app = modal.App.lookup("ff-harbor-parity", create_if_missing=True)
 
     def fetch(sandbox, command: str) -> bytes:
@@ -252,11 +286,16 @@ def run_one(backend: Backend, query_dir: Path, task: Task, model: str) -> str:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    if set_vars := [v for v in HOST_OVERRIDES if os.environ.get(v)]:
+        raise SystemExit(
+            f"unset these first; Harbor's side runs without them: {set_vars}"
+        )
     tasks = dataset_tasks(args.dataset)
     if args.limit:
         tasks = dict(list(tasks.items())[: args.limit])
-    backend = BACKENDS[args.backend](args.claude_code_version)
     out = args.out.resolve()
+    context = agent_image_dir(args.dataset, args.claude_code_version, out)
+    backend = BACKENDS[args.backend](context, args.claude_code_version)
     with ThreadPoolExecutor(args.concurrency) as pool:
         futures = {
             qid: pool.submit(run_one, backend, out / qid, task, args.model)
@@ -264,7 +303,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         }
         for qid, fut in futures.items():
             print(f"{qid}: {fut.result()}", flush=True)
-    collect([out], None)
+    collect([out], None, 0)
 
 
 def harbor_status(trial: Path) -> str:
@@ -279,8 +318,11 @@ def harbor_status(trial: Path) -> str:
     return parse_status(trial / "agent" / "claude-code.txt")
 
 
-def records(path: Path) -> dict[str, tuple[str, str]]:
-    """query_id -> (status, report) from an original-side run dir or a Harbor job dir."""
+Record = tuple[str, str, float | None]  # status, report, Harbor reward
+
+
+def records(path: Path) -> dict[str, Record]:
+    """query_id -> record from an original-side run dir or a Harbor job dir."""
     found = {}
     for entry in sorted(p for p in path.iterdir() if p.is_dir()):
         config = entry / "config.json"
@@ -289,9 +331,18 @@ def records(path: Path) -> dict[str, tuple[str, str]]:
                 json.loads(config.read_text())["task"]["path"]
             ).name.removeprefix("frontier-finance-")
             report = entry / "artifacts" / "app" / "report.md"
+            result = entry / "result.json"
+            rewards = (
+                (json.loads(result.read_text()).get("verifier_result") or {}).get(
+                    "rewards"
+                )
+                if result.is_file()
+                else None
+            ) or {}
             found[qid] = (
                 harbor_status(entry),
                 report.read_text() if report.is_file() else "",
+                rewards.get("reward"),
             )
         elif (entry / "instruction.md").is_file():  # original-side query
             status = (
@@ -300,30 +351,87 @@ def records(path: Path) -> dict[str, tuple[str, str]]:
                 else "no_result"
             )
             report = entry / "app" / "report.md"
-            found[entry.name] = (status, report.read_text() if report.is_file() else "")
+            found[entry.name] = (
+                status,
+                report.read_text() if report.is_file() else "",
+                None,
+            )
     return found
 
 
-def collect(paths: list[Path], summaries: Path | None) -> None:
+def collect(paths: list[Path], summaries: Path | None, chunk: int) -> None:
+    """paths are one run: a first attempt, then reruns that replace its queries."""
+    recs: dict[str, Record] = {}
+    attempts: Counter[str] = Counter()
     for path in paths:
-        recs = records(path)
-        counts = Counter(status for status, _ in recs.values())
-        rerun = sorted(q for q, (s, _) in recs.items() if s not in FINAL_STATUSES)
-        no_report = sum(1 for _, report in recs.values() if not report.strip())
+        for qid, rec in records(path).items():
+            attempts[qid] += 1
+            recs[qid] = rec
+    counts = Counter(status for status, _, _ in recs.values())
+    rerun = sorted(q for q, (s, _, _) in recs.items() if s not in FINAL_STATUSES)
+    no_report = sum(1 for _, report, _ in recs.values() if not report.strip())
+    print(
+        f"== {len(recs)} queries, {no_report} without a report, "
+        f"{sum(n > 1 for n in attempts.values())} rerun at least once  "
+        + "  ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    )
+    if rerun:
+        print(f"   to rerun ({len(rerun)}): {' '.join(rerun)}")
+        print("   Harbor side: harbor run ... " + " ".join(f"-i '*{q}'" for q in rerun))
+    rewards = [r for s, _, r in recs.values() if s in FINAL_STATUSES and r is not None]
+    if rewards:
         print(
-            f"== {path}: {len(recs)} queries, {no_report} without a report  "
-            + "  ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            f"   Harbor mean reward over {len(rewards)} final trials: "
+            f"{sum(rewards) / len(rewards):.4f}"
         )
-        if rerun:
-            print(f"   to rerun ({len(rerun)}): {' '.join(rerun)}")
-        if summaries:
-            rows = [
-                {"query_id": q, "system_summary": report}
-                for q, (_, report) in sorted(recs.items())
-            ]
-            summaries.parent.mkdir(parents=True, exist_ok=True)
-            summaries.write_text(json.dumps(rows, indent=2))
-            print(f"   wrote {len(rows)} summaries to {summaries}")
+    if summaries:
+        rows = [
+            {"query_id": q, "system_summary": report}
+            for q, (_, report, _) in sorted(recs.items())
+        ]
+        parts = (
+            [rows[i : i + chunk] for i in range(0, len(rows), chunk)]
+            if chunk
+            else [rows]
+        )
+        summaries.parent.mkdir(parents=True, exist_ok=True)
+        for i, part in enumerate(parts):
+            target = (
+                summaries.with_name(f"{summaries.stem}{i:02d}{summaries.suffix}")
+                if chunk
+                else summaries
+            )
+            target.write_text(json.dumps(part, indent=2))
+        print(
+            f"   wrote {len(rows)} summaries in {len(parts)} file(s) next to {summaries}"
+        )
+
+
+def score(per_item_files: list[Path]) -> float:
+    """Upstream macro_avg_qualification_rate_on_all_queries over the merged files.
+
+    Queries whose grading lost any judge's votes (judge_error, or a non-empty
+    failed_checks_by_judge) are listed for a regrade and left out until then.
+    """
+    items = {}
+    for path in per_item_files:
+        for item in json.loads(path.read_text()):
+            items[item["query_id"]] = item
+    regrade = sorted(
+        q
+        for q, it in items.items()
+        if it["failure_reason"] == "judge_error" or it["failed_checks_by_judge"]
+    )
+    rates = [
+        it["num_qualified"] / it["num_rubrics"] if it["num_rubrics"] else 0.0
+        for q, it in items.items()
+        if q not in regrade
+    ]
+    macro = sum(rates) / len(rates) if rates else 0.0
+    print(f"== {len(items)} graded queries, {len(rates)} scored, macro {macro:.4f}")
+    if regrade:
+        print(f"   to regrade ({len(regrade)}): {' '.join(regrade)}")
+    return macro
 
 
 def main() -> None:
@@ -365,20 +473,26 @@ def main() -> None:
         help="where each task's container runs",
     )
     p.add_argument("--limit", type=int, help="first N queries only (sanity run)")
-    p = sub.add_parser("collect", help="count statuses and write system_summaries.json")
+    p = sub.add_parser("collect", help="apply the rerun rule, write summaries")
     p.add_argument(
-        "paths", type=Path, nargs="+", help="original-side run dirs or Harbor job dirs"
+        "paths",
+        type=Path,
+        nargs="+",
+        help="one run: an original-side run dir, or a Harbor job dir then its rerun jobs",
     )
+    p.add_argument("--summaries", type=Path, help="write system_summaries.json")
     p.add_argument(
-        "--summaries", type=Path, help="write system_summaries.json (one path only)"
+        "--chunk", type=int, default=0, help="queries per summaries file (0: one file)"
     )
+    p = sub.add_parser("score", help="merge per_item.json files into the macro rate")
+    p.add_argument("per_item", type=Path, nargs="+", help="later files replace earlier")
     args = parser.parse_args()
     if args.cmd == "run":
         cmd_run(args)
+    elif args.cmd == "collect":
+        collect(args.paths, args.summaries, args.chunk)
     else:
-        if args.summaries and len(args.paths) != 1:
-            parser.error("--summaries takes exactly one path")
-        collect(args.paths, args.summaries)
+        score(args.per_item)
 
 
 if __name__ == "__main__":

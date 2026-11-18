@@ -215,24 +215,28 @@ side runs `claude-code` outside Harbor with the same version, model, flags,
 environment variables, instruction text and time limit as Harbor's
 `claude-code` agent.
 
-- `harbor_parity/Dockerfile` mirrors the Harbor task image and installs a pinned
-  `claude-code`.
-- `harbor_parity/run_claude_code.py run` reads the Harbor-generated tasks, runs one
-  fresh container per query (local Docker, or a Modal sandbox with `--backend modal`)
-  with the task's CPU, memory and time limits and the instruction on stdin, and keeps
-  `/app/report.md`, the `stream-json` log and the session files. Rerunning skips
-  queries with a final status.
-- `harbor_parity/run_claude_code.py collect` counts statuses for an original run
-  or a Harbor job and writes `system_summaries.json`.
+- `harbor_parity/run_claude_code.py run` reads the Harbor-generated tasks and runs one
+  fresh container per query (local Docker, or a Modal sandbox with `--backend modal`).
+  The image is the task's own `environment/Dockerfile` plus Harbor's `claude-code`
+  install step. Each run gets the task's CPU, memory and time limits and the
+  instruction on stdin, and keeps `/app/report.md`, the `stream-json` log and the
+  session files. Rerunning skips queries with a final status.
+- `harbor_parity/run_claude_code.py collect` applies one rerun rule to an original run
+  or a Harbor job (plus its rerun jobs) and writes the summaries for the grader,
+  optionally in chunks (`--chunk`).
+- `harbor_parity/run_claude_code.py score` merges the grader's `per_item.json` files
+  into `macro_avg_qualification_rate_on_all_queries` and lists queries that lost a
+  judge's votes, for a regrade.
 
 ```bash
 export ANTHROPIC_API_KEY=...            # and ANTHROPIC_BASE_URL for a gateway
 python harbor_parity/run_claude_code.py run -d <adapters>/datasets/frontier-finance \
     -o runs/original1 -m <model> --claude-code-version <version> -n 8
 python harbor_parity/run_claude_code.py collect runs/original1 \
-    --summaries runs/original1/system_summaries.json
-# set responses_path in eval.example.yaml to the summaries, then:
-uv run frontier-finance-grader --config eval.example.yaml
+    --summaries runs/original1/summaries/part.json --chunk 20
+# grade each chunk: eval.example.yaml with responses_path -> the chunk, output_dir -> its own
+uv run frontier-finance-grader --config <chunk config>
+python harbor_parity/run_claude_code.py score runs/original1/grades/*/per_item.json
 ```
 
 The Harbor side runs `run_frontier-finance_parity.yaml` from the adapter with
