@@ -16,10 +16,10 @@
 Usage (from the repository root). ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN for a
 bearer-auth gateway, and an optional ANTHROPIC_BASE_URL come from the environment;
 --backend modal also needs the modal package and a Modal login; --backend daytona
-needs the daytona package (<1, as Harbor 0.27.0 pins it) and DAYTONA_API_KEY:
+needs the daytona package (0.233.0, the version Harbor 0.27.0 resolves) and DAYTONA_API_KEY:
 
-  python harbor_parity/run_claude_code.py run -d <harbor>/datasets/frontier-finance \\
-      -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.330 -n 8
+  python harbor_parity/run_claude_code.py run -d <adapters>/datasets/frontier-finance-parity \\
+      -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.330 -n 8 --backend daytona
   python harbor_parity/run_claude_code.py collect runs/original1 \\
       --summaries runs/original1/system_summaries.json
 
@@ -413,7 +413,7 @@ def harbor_status(trial: Path) -> str:
         else {}
     )
     exception = (result.get("exception_info") or {}).get("exception_type", "")
-    if "Timeout" in exception and "Agent" in exception:
+    if exception == "AgentTimeoutError":  # not AgentSetupTimeoutError: setup is infra
         return "timeout"
     return parse_status(trial / "agent" / "claude-code.txt")
 
@@ -495,7 +495,10 @@ def collect(paths: list[Path], summaries: Path | None) -> None:
     )
     if rerun:
         print(f"   to rerun ({len(rerun)}): {' '.join(rerun)}")
-        print("   Harbor side: harbor run ... " + " ".join(f"-i '*{q}'" for q in rerun))
+        print(
+            "   Harbor side: harbor run -c ... -p <dataset> "
+            + " ".join(f"-i '*{q}'" for q in rerun)
+        )
     if regrade:
         print(
             f"   to regrade, left out of the mean ({len(regrade)}): {' '.join(regrade)}"

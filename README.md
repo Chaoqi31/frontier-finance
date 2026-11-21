@@ -221,7 +221,7 @@ environment variables, instruction text and time limit as Harbor's
 
 - `harbor_parity/run_claude_code.py run` reads the Harbor-generated tasks and runs one
   fresh container per query: local Docker, a Modal sandbox (`--backend modal`) or a
-  Daytona sandbox (`--backend daytona`, needs `daytona<1`, as Harbor 0.27.0 pins it, and `DAYTONA_API_KEY`).
+  Daytona sandbox (`--backend daytona`, needs `daytona==0.233.0`, the version Harbor 0.27.0 resolves, and `DAYTONA_API_KEY`).
   The image is the task's own `environment/Dockerfile` plus Harbor's `claude-code`
   install step. Each run gets the task's CPU, memory and time limits and the
   instruction on stdin, and keeps `/app/report.md`, the `stream-json` log and the
@@ -247,10 +247,10 @@ python harbor_parity/run_claude_code.py run -d <adapters>/datasets/frontier-fina
     --backend daytona
 python harbor_parity/run_claude_code.py collect runs/original1 \
     --summaries runs/original1/system_summaries.json
-# once: the subset's rubrics, so the macro is over the 11 queries, not all 220
+# the rubrics of the queries that ran (all 11 for a full run), so no query counts as no_response
 cat <adapters>/datasets/frontier-finance-parity/*/tests/rubrics.jsonl > parity_rubrics.jsonl
 # judge keys and base URLs: ANTHROPIC_*, OPENAI_*, GEMINI_API_KEY, GOOGLE_GEMINI_BASE_URL
-uv run frontier-finance-grader --config harbor_parity/eval.parity.yaml \
+uv run --frozen --extra all frontier-finance-grader --config harbor_parity/eval.parity.yaml \
     --responses runs/original1/system_summaries.json --output-dir runs/original1/grades
 python harbor_parity/run_claude_code.py score runs/original1/grades/per_item.json
 ```
