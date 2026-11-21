@@ -68,12 +68,13 @@ HOST_OVERRIDES = (
     "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
     *ALIAS_VARS,
 )
-# Harbor's claude-code install step (ensure_system_dependencies, then bootstrap.sh),
-# appended to the task's environment/Dockerfile.
+# Harbor's claude-code install step, appended to the task's environment/Dockerfile.
+# ensure_system_dependencies installs only the missing packages (the image already
+# has curl and bash) with exactly this command, and leaves the apt lists in place.
 INSTALL_LAYER = """
-RUN apt-get update && apt-get install -y --no-install-recommends curl bash nodejs npm procps \\
-    && rm -rf /var/lib/apt/lists/*
+RUN export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install -y nodejs npm procps
 RUN curl -fsSL https://downloads.claude.ai/claude-code-releases/bootstrap.sh | bash -s -- {version} \\
+    && echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc \\
     && /root/.local/bin/claude --version
 ENV PATH="/root/.local/bin:$PATH"
 WORKDIR /app
