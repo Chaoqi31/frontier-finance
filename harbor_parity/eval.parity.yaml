@@ -3,17 +3,17 @@
 #   frontier-finance-grader --config harbor_parity/eval.parity.yaml \
 #       --responses runs/original1/system_summaries.json --output-dir runs/original1/grades
 # Only the parity subset's rubrics, so the macro is over those queries, not all 220.
-# Everything but the paths and judge_models is eval.example.yaml's.
+# Everything but the paths is eval.example.yaml's.
 
 rubrics_path: parity_rubrics.jsonl
 responses_path: system_summaries.json
 output_dir: grader_results/
 
-# Parity judge panel, the same models and order as FF_JUDGE_MODELS on the Harbor side.
+# Upstream's judge panel, the same as the Harbor task's default.
 judge_models:
-  - claude-haiku-5-5
-  - gemini-3.8-flash
-  - gpt-6-luna
+  - claude-sonnet-4-6
+  - gemini-3.1-pro-preview
+  - gpt-5.4
 
 max_rubrics_per_call: 30
 concurrency: 8

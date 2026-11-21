@@ -13,11 +13,9 @@ import re
 from abc import ABC, abstractmethod
 
 # Newer Claude models reject temperature/top_p/top_k with a 400; older ones
-# accept temperature=0. Matches the (Opus 4.7+ / Sonnet 5 / Haiku 5 / Fable /
-# Mythos) rule the internal client applies.
-_CLAUDE_VERSIONED_RE = re.compile(r"claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?")
-# GPT-6 and later reject any temperature but the default (1) with a 400.
-_GPT_MAJOR_RE = re.compile(r"gpt-(\d+)")
+# accept temperature=0. Matches the (Opus 4.7+ / Sonnet 5 / Fable / Mythos)
+# rule the internal client applies.
+_CLAUDE_VERSIONED_RE = re.compile(r"claude-(opus|sonnet)-(\d+)(?:-(\d+))?")
 
 
 class Judge(ABC):
@@ -100,9 +98,9 @@ class AnthropicJudge(Judge):
     def _claude_rejects_sampling_params(model: str) -> bool:
         """True for Claude models that 400 on temperature/top_p/top_k.
 
-        Opus 4.7+, Sonnet 5+, Haiku 5+, Fable, and Mythos reject non-default
-        sampling parameters entirely; older Claude models (Opus 4.6, Sonnet 4.x,
-        Haiku 4.x) accept temperature=0.
+        Opus 4.7+, Sonnet 5+, Fable, and Mythos reject non-default sampling
+        parameters entirely; older Claude models (Opus 4.6, Sonnet 4.x, Haiku)
+        accept temperature=0.
         """
         if model.startswith(("claude-fable-", "claude-mythos-")):
             return True
@@ -112,7 +110,7 @@ class AnthropicJudge(Judge):
         family, major, minor = m.group(1), int(m.group(2)), int(m.group(3) or 0)
         if family == "opus":
             return (major, minor) >= (4, 7)
-        return family in ("sonnet", "haiku") and major >= 5
+        return family == "sonnet" and major >= 5
 
     def complete(self, system: str, user: str) -> str:
         kwargs: dict = {}
@@ -149,12 +147,9 @@ class OpenAIJudge(Judge):
     def complete(self, system: str, user: str) -> str:
         kwargs: dict = {}
         # Pin temperature=0 for deterministic judging on gpt-* chat models. The
-        # o* reasoning models and GPT-6+ 400 on any temperature != 1, so it's
-        # omitted there.
+        # o* reasoning models 400 on any temperature != 1, so it's omitted there.
         if self.model.startswith("gpt-"):
-            m = _GPT_MAJOR_RE.match(self.model)
-            if not m or int(m.group(1)) < 6:
-                kwargs["temperature"] = 0
+            kwargs["temperature"] = 0
         response = self._client.chat.completions.create(
             model=self.model,
             messages=[
@@ -187,30 +182,17 @@ class GeminiJudge(Judge):
                 f"GEMINI_API_KEY (or GOOGLE_API_KEY) must be set to use judge model {model!r}."
             )
         self._client = genai.Client(api_key=api_key)
-        self._minimal_unsupported = False
 
     def complete(self, system: str, user: str) -> str:
-        from google.genai import errors as genai_errors
+        from google.genai import types
 
         # gemini-3 supports thinking-level control; pro models require at least
-        # LOW, others accept MINIMAL except where the model rejects it (e.g.
-        # gemini-3.8-flash), which falls back to LOW. Keep thinking shallow so it
-        # doesn't eat the output budget on what is a mechanical labelling task.
-        if not self.model.startswith("gemini-3"):
-            return self._generate(system, user, None)
-        if "pro" in self.model or self._minimal_unsupported:
-            return self._generate(system, user, "LOW")
-        try:
-            return self._generate(system, user, "MINIMAL")
-        except genai_errors.ClientError as e:
-            message = str(e).lower()
-            if "thinking level" not in message or "unsupported" not in message:
-                raise
-            self._minimal_unsupported = True
-            return self._generate(system, user, "LOW")
-
-    def _generate(self, system: str, user: str, level: str | None) -> str:
-        from google.genai import types
+        # LOW, others accept MINIMAL. Keep thinking shallow so it doesn't eat the
+        # output budget on what is a mechanical labelling task.
+        thinking_config = None
+        if self.model.startswith("gemini-3"):
+            level = "LOW" if "pro" in self.model else "MINIMAL"
+            thinking_config = types.ThinkingConfig(thinking_level=level)
 
         response = self._client.models.generate_content(
             model=self.model,
@@ -219,9 +201,7 @@ class GeminiJudge(Judge):
                 system_instruction=system,
                 max_output_tokens=self._max_tokens,
                 temperature=0,
-                thinking_config=types.ThinkingConfig(thinking_level=level)
-                if level
-                else None,
+                thinking_config=thinking_config,
             ),
         )
         return response.text or ""

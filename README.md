@@ -210,11 +210,7 @@ this repository's license. See [NOTICE](NOTICE) for details.
 
 This fork adds `harbor_parity/` for the parity experiment of the
 [Harbor FrontierFinance adapter](https://github.com/harbor-index/adapters/tree/main/src/frontier-finance).
-The grader is upstream `8b71342` plus one compatibility change in
-`frontier_finance/judges.py` for newer judge models: no `temperature` for Claude
-Haiku 5+ and GPT-6+, which reject it, and `LOW` thinking when a Gemini 3 Flash
-model rejects `MINIMAL`. Prompts, batching, parsing and voting are unchanged, and
-the upstream panel gets the same requests as before. Upstream ships no agent, so the original
+The grader is unchanged from upstream `8b71342`. Upstream ships no agent, so the original
 side runs `claude-code` outside Harbor with the same version, model, flags,
 environment variables, instruction text and time limit as Harbor's
 `claude-code` agent.
@@ -231,11 +227,10 @@ environment variables, instruction text and time limit as Harbor's
   or a Harbor job (plus its rerun jobs) and writes the summaries for the grader.
   On a Harbor job it also lists trials whose grading lost a judge's votes, by the
   same rule as `score`, and leaves them out of the mean reward until regraded.
-- `harbor_parity/eval.parity.yaml` is the grader config for parity: the subset's
-  rubrics only, and the parity judge panel
-  (`claude-haiku-5-5`, `gemini-3.8-flash`, `gpt-6-luna`), the same as
-  `FF_JUDGE_MODELS` on the Harbor side. These judges are not the upstream panel, so parity scores
-  are not comparable with the upstream leaderboard.
+- `harbor_parity/eval.parity.yaml` is the grader config for parity: `eval.example.yaml`
+  with the paths changed to the parity subset's rubrics, so the upstream judge panel
+  (`claude-sonnet-4-6`, `gemini-3.1-pro-preview`, `gpt-5.4`) grades both sides, as it
+  does by default on the Harbor side.
 - `harbor_parity/run_claude_code.py score` merges the grader's `per_item.json` files
   into `macro_avg_qualification_rate_on_all_queries` and lists queries that lost a
   judge's votes, for a regrade.
