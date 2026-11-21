@@ -210,33 +210,49 @@ this repository's license. See [NOTICE](NOTICE) for details.
 
 This fork adds `harbor_parity/` for the parity experiment of the
 [Harbor FrontierFinance adapter](https://github.com/harbor-index/adapters/tree/main/src/frontier-finance).
-The grader is unchanged at `8b71342`. Upstream ships no agent, so the original
+The grader is upstream `8b71342` plus one compatibility change in
+`frontier_finance/judges.py` for newer judge models: no `temperature` for Claude
+Haiku 5+ and GPT-6+, which reject it, and `LOW` thinking when a Gemini 3 Flash
+model rejects `MINIMAL`. Prompts, batching, parsing and voting are unchanged, and
+the upstream panel gets the same requests as before. Upstream ships no agent, so the original
 side runs `claude-code` outside Harbor with the same version, model, flags,
 environment variables, instruction text and time limit as Harbor's
 `claude-code` agent.
 
 - `harbor_parity/run_claude_code.py run` reads the Harbor-generated tasks and runs one
-  fresh container per query (local Docker, or a Modal sandbox with `--backend modal`).
+  fresh container per query: local Docker, a Modal sandbox (`--backend modal`) or a
+  Daytona sandbox (`--backend daytona`, needs `daytona<2` and `DAYTONA_API_KEY`).
   The image is the task's own `environment/Dockerfile` plus Harbor's `claude-code`
   install step. Each run gets the task's CPU, memory and time limits and the
   instruction on stdin, and keeps `/app/report.md`, the `stream-json` log and the
-  session files. Rerunning skips queries with a final status.
+  session files. Rerunning skips queries with a final status; a backend failure
+  (`backend_error`) is not final and is retried.
 - `harbor_parity/run_claude_code.py collect` applies one rerun rule to an original run
-  or a Harbor job (plus its rerun jobs) and writes the summaries for the grader,
-  optionally in chunks (`--chunk`).
+  or a Harbor job (plus its rerun jobs) and writes the summaries for the grader.
+  On a Harbor job it also lists trials whose grading lost a judge's votes, by the
+  same rule as `score`, and leaves them out of the mean reward until regraded.
+- `harbor_parity/eval.parity.yaml` is the grader config for parity: the subset's
+  rubrics only, and the parity judge panel
+  (`claude-haiku-5-5`, `gemini-3.8-flash`, `gpt-6-luna`), the same as
+  `FF_JUDGE_MODELS` on the Harbor side. These judges are not the upstream panel, so parity scores
+  are not comparable with the upstream leaderboard.
 - `harbor_parity/run_claude_code.py score` merges the grader's `per_item.json` files
   into `macro_avg_qualification_rate_on_all_queries` and lists queries that lost a
   judge's votes, for a regrade.
 
 ```bash
-export ANTHROPIC_API_KEY=...            # and ANTHROPIC_BASE_URL for a gateway
-python harbor_parity/run_claude_code.py run -d <adapters>/datasets/frontier-finance \
-    -o runs/original1 -m <model> --claude-code-version <version> -n 8
+export ANTHROPIC_API_KEY=... ANTHROPIC_BASE_URL=...   # the parity gateway
+python harbor_parity/run_claude_code.py run -d <adapters>/datasets/frontier-finance-parity \
+    -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.326 -n 8 \
+    --backend daytona
 python harbor_parity/run_claude_code.py collect runs/original1 \
-    --summaries runs/original1/summaries/part.json --chunk 20
-# grade each chunk: eval.example.yaml with responses_path -> the chunk, output_dir -> its own
-uv run frontier-finance-grader --config <chunk config>
-python harbor_parity/run_claude_code.py score runs/original1/grades/*/per_item.json
+    --summaries runs/original1/system_summaries.json
+# once: the subset's rubrics, so the macro is over the 11 queries, not all 220
+cat <adapters>/datasets/frontier-finance-parity/*/tests/rubrics.jsonl > parity_rubrics.jsonl
+# judge keys and base URLs: ANTHROPIC_*, OPENAI_*, GEMINI_API_KEY, GOOGLE_GEMINI_BASE_URL
+uv run frontier-finance-grader --config harbor_parity/eval.parity.yaml \
+    --responses runs/original1/system_summaries.json --output-dir runs/original1/grades
+python harbor_parity/run_claude_code.py score runs/original1/grades/per_item.json
 ```
 
 The Harbor side runs `run_frontier-finance_parity.yaml` from the adapter with

@@ -3,4 +3,5 @@
 __pycache__/
 .env
 data/
-grader_results/
+grader_results/parity_rubrics.jsonl
+runs/

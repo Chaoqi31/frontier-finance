@@ -1,7 +1,7 @@
 """Original side of Harbor parity for FrontierFinance: claude-code outside Harbor.
 
-  run      Run claude-code once per query in a fresh container, on local Docker
-           or in a Modal sandbox (--backend). The image is the task's own
+  run      Run claude-code once per query in a fresh container, on local Docker,
+           a Modal sandbox or a Daytona sandbox (--backend). The image is the task's own
            environment/Dockerfile plus the install step Harbor's claude-code
            agent runs; the instruction text, model, claude-code version, flags,
            environment, resources and time limit are Harbor's too. Rerunning the
@@ -10,22 +10,21 @@
   collect  Apply one rerun rule to either side and write system_summaries.json
            for the grader. Takes an original-side run directory or Harbor job
            directories (a job, then rerun jobs: later trials replace earlier ones).
-           --chunk splits the summaries so a grading failure loses one chunk.
   score    Merge the grader's per_item.json files (later files replace earlier
            queries) into the macro qualification rate, and list queries to regrade.
 
 Usage (from the repository root). ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN for a
 bearer-auth gateway, and an optional ANTHROPIC_BASE_URL come from the environment;
---backend modal also needs the modal package and a Modal login:
+--backend modal also needs the modal package and a Modal login; --backend daytona
+needs the daytona package (<2, the API Harbor 0.26.0 uses) and DAYTONA_API_KEY:
 
   python harbor_parity/run_claude_code.py run -d <harbor>/datasets/frontier-finance \\
       -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.326 -n 8
   python harbor_parity/run_claude_code.py collect runs/original1 \\
-      --summaries runs/original1/summaries/part.json --chunk 20
+      --summaries runs/original1/system_summaries.json
 
-Then grade each chunk with this repository's grader and eval.example.yaml
-unchanged (responses_path -> the chunk, output_dir -> its own directory), and
-  python harbor_parity/run_claude_code.py score runs/original1/grades/*/per_item.json
+Then grade with this repository's grader and harbor_parity/eval.parity.yaml, and
+  python harbor_parity/run_claude_code.py score grader_results/per_item.json
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ import argparse
 import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -94,6 +94,7 @@ class Task:
     timeout: float
     cpus: float
     memory_mb: int
+    storage_mb: int
 
 
 def dataset_tasks(dataset: Path) -> dict[str, Task]:
@@ -108,6 +109,7 @@ def dataset_tasks(dataset: Path) -> dict[str, Task]:
             float(config["agent"]["timeout_sec"]),
             float(config["environment"]["cpus"]),
             int(config["environment"]["memory_mb"]),
+            int(config["environment"]["storage_mb"]),
         )
     return tasks
 
@@ -262,7 +264,100 @@ def modal_backend(context: Path, version: str) -> Backend:
     return run
 
 
-BACKENDS = {"docker": docker_backend, "modal": modal_backend}
+def daytona_backend(context: Path, version: str) -> Backend:
+    from daytona import (
+        CreateSandboxFromImageParams,
+        Daytona,
+        DaytonaError,
+        DaytonaNotFoundError,
+        Image,
+        Resources,
+        SessionExecuteRequest,
+    )
+
+    client = Daytona()  # DAYTONA_API_KEY from the environment
+    image = Image.from_dockerfile(context / "Dockerfile")
+
+    def run(query_dir: Path, task: Task, env: dict[str, str]) -> tuple[int, bool]:
+        sandbox = client.create(
+            CreateSandboxFromImageParams(
+                image=image,
+                os_user="root",  # as the docker and modal backends
+                resources=Resources(
+                    cpu=max(1, round(task.cpus)),
+                    memory=task.memory_mb // 1024,
+                    disk=task.storage_mb // 1024,
+                ),
+                labels={"ff-parity": "original"},
+                auto_stop_interval=0,
+                ephemeral=True,
+                # Reaps a sandbox this process fails to delete.
+                ttl_minutes=int(task.timeout // 60) + 60,
+            ),
+            timeout=1800,
+        )
+        try:
+            session = uuid.uuid4().hex
+            sandbox.process.create_session(session)
+
+            def sh(command: str, deadline: float) -> int | None:
+                """Exit code, or None if `deadline` (monotonic) passes first."""
+                cmd = sandbox.process.execute_session_command(
+                    session, SessionExecuteRequest(command=command, run_async=True)
+                )
+                errors = 0
+                while time.monotonic() < deadline:
+                    try:
+                        code = sandbox.process.get_session_command(
+                            session, cmd.cmd_id
+                        ).exit_code
+                        errors = 0
+                    except DaytonaError:
+                        # A transient API error must not lose a paid agent run.
+                        errors += 1
+                        if errors >= 12:
+                            raise
+                        code = None
+                    if code is not None:
+                        return int(code)
+                    time.sleep(5)
+                return None
+
+            sandbox.fs.upload_file(task.instruction.encode(), "/tmp/instruction.md")
+            # Variables inline as Harbor's Daytona exec passes them; `timeout`
+            # exits 124 when the agent limit is reached.
+            env_args = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+            code = sh(
+                f"env {env_args} timeout {int(task.timeout)} "
+                f"bash -c {shlex.quote(AGENT_COMMAND)} < /tmp/instruction.md",
+                time.monotonic() + task.timeout + 300,
+            )
+            sh(
+                "tar -czf /tmp/sessions.tar.gz -C /logs/agent sessions",
+                time.monotonic() + 300,
+            )
+            agent_dir = query_dir / "logs" / "agent"
+            for remote, local in (
+                ("/app/report.md", query_dir / "app" / "report.md"),
+                ("/logs/agent/claude-code.txt", agent_dir / "claude-code.txt"),
+                ("/tmp/sessions.tar.gz", agent_dir / "sessions.tar.gz"),
+            ):
+                try:
+                    local.write_bytes(sandbox.fs.download_file(remote) or b"")
+                except DaytonaNotFoundError:
+                    local.write_bytes(b"")  # missing: no report, or no log
+            return (-1, True) if code is None else (code, code == 124)
+        finally:
+            sandbox.delete()
+
+    return run
+
+
+BACKENDS = {
+    "docker": docker_backend,
+    "modal": modal_backend,
+    "daytona": daytona_backend,
+}
 
 
 def run_one(backend: Backend, query_dir: Path, task: Task, model: str) -> str:
@@ -274,7 +369,12 @@ def run_one(backend: Backend, query_dir: Path, task: Task, model: str) -> str:
     (query_dir / "app").mkdir(parents=True)
     (query_dir / "logs" / "agent").mkdir(parents=True)
     (query_dir / "instruction.md").write_text(task.instruction)
-    code, timed_out = backend(query_dir, task, agent_env(model))
+    try:
+        code, timed_out = backend(query_dir, task, agent_env(model))
+    except Exception as e:  # noqa: BLE001  any backend failure is rerun, not scored
+        print(f"{query_dir.name}: backend error: {e!r}", flush=True)
+        status_file.write_text("backend_error")
+        return "backend_error"
     status = (
         "timeout"
         if timed_out
@@ -303,7 +403,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         }
         for qid, fut in futures.items():
             print(f"{qid}: {fut.result()}", flush=True)
-    collect([out], None, 0)
+    collect([out], None)
 
 
 def harbor_status(trial: Path) -> str:
@@ -318,7 +418,19 @@ def harbor_status(trial: Path) -> str:
     return parse_status(trial / "agent" / "claude-code.txt")
 
 
-Record = tuple[str, str, float | None]  # status, report, Harbor reward
+# status, report, Harbor reward, Harbor grading lost judge votes
+Record = tuple[str, str, float | None, bool]
+
+
+def lost_votes(trial: Path, reward: float | None) -> bool:
+    """score()'s regrade rule on a Harbor trial: no reward, or a judge without votes."""
+    grading = trial / "verifier" / "grading.json"
+    g = json.loads(grading.read_text()) if grading.is_file() else {}
+    return (
+        reward is None
+        or g.get("failure_reason") == "judge_error"
+        or bool(g.get("failed_checks_by_judge"))
+    )
 
 
 def records(path: Path) -> dict[str, Record]:
@@ -339,10 +451,12 @@ def records(path: Path) -> dict[str, Record]:
                 if result.is_file()
                 else None
             ) or {}
+            reward = rewards.get("reward")
             found[qid] = (
                 harbor_status(entry),
                 report.read_text() if report.is_file() else "",
-                rewards.get("reward"),
+                reward,
+                lost_votes(entry, reward),
             )
         elif (entry / "instruction.md").is_file():  # original-side query
             status = (
@@ -355,11 +469,12 @@ def records(path: Path) -> dict[str, Record]:
                 status,
                 report.read_text() if report.is_file() else "",
                 None,
+                False,
             )
     return found
 
 
-def collect(paths: list[Path], summaries: Path | None, chunk: int) -> None:
+def collect(paths: list[Path], summaries: Path | None) -> None:
     """paths are one run: a first attempt, then reruns that replace its queries."""
     recs: dict[str, Record] = {}
     attempts: Counter[str] = Counter()
@@ -367,9 +482,12 @@ def collect(paths: list[Path], summaries: Path | None, chunk: int) -> None:
         for qid, rec in records(path).items():
             attempts[qid] += 1
             recs[qid] = rec
-    counts = Counter(status for status, _, _ in recs.values())
-    rerun = sorted(q for q, (s, _, _) in recs.items() if s not in FINAL_STATUSES)
-    no_report = sum(1 for _, report, _ in recs.values() if not report.strip())
+    counts = Counter(status for status, *_ in recs.values())
+    rerun = sorted(q for q, (s, *_) in recs.items() if s not in FINAL_STATUSES)
+    regrade = sorted(
+        q for q, (s, _, _, lost) in recs.items() if s in FINAL_STATUSES and lost
+    )
+    no_report = sum(1 for _, report, *_ in recs.values() if not report.strip())
     print(
         f"== {len(recs)} queries, {no_report} without a report, "
         f"{sum(n > 1 for n in attempts.values())} rerun at least once  "
@@ -378,7 +496,15 @@ def collect(paths: list[Path], summaries: Path | None, chunk: int) -> None:
     if rerun:
         print(f"   to rerun ({len(rerun)}): {' '.join(rerun)}")
         print("   Harbor side: harbor run ... " + " ".join(f"-i '*{q}'" for q in rerun))
-    rewards = [r for s, _, r in recs.values() if s in FINAL_STATUSES and r is not None]
+    if regrade:
+        print(
+            f"   to regrade, left out of the mean ({len(regrade)}): {' '.join(regrade)}"
+        )
+    rewards = [
+        r
+        for s, _, r, lost in recs.values()
+        if s in FINAL_STATUSES and r is not None and not lost
+    ]
     if rewards:
         print(
             f"   Harbor mean reward over {len(rewards)} final trials: "
@@ -387,24 +513,11 @@ def collect(paths: list[Path], summaries: Path | None, chunk: int) -> None:
     if summaries:
         rows = [
             {"query_id": q, "system_summary": report}
-            for q, (_, report, _) in sorted(recs.items())
+            for q, (_, report, *_) in sorted(recs.items())
         ]
-        parts = (
-            [rows[i : i + chunk] for i in range(0, len(rows), chunk)]
-            if chunk
-            else [rows]
-        )
         summaries.parent.mkdir(parents=True, exist_ok=True)
-        for i, part in enumerate(parts):
-            target = (
-                summaries.with_name(f"{summaries.stem}{i:02d}{summaries.suffix}")
-                if chunk
-                else summaries
-            )
-            target.write_text(json.dumps(part, indent=2))
-        print(
-            f"   wrote {len(rows)} summaries in {len(parts)} file(s) next to {summaries}"
-        )
+        summaries.write_text(json.dumps(rows, indent=2))
+        print(f"   wrote {len(rows)} summaries to {summaries}")
 
 
 def score(per_item_files: list[Path]) -> float:
@@ -458,7 +571,7 @@ def main() -> None:
         "-m",
         "--model",
         required=True,
-        help="Anthropic model id, as in Harbor's -m without 'anthropic/'",
+        help="model id, as in Harbor's -m without 'anthropic/'",
     )
     p.add_argument(
         "--claude-code-version",
@@ -481,16 +594,13 @@ def main() -> None:
         help="one run: an original-side run dir, or a Harbor job dir then its rerun jobs",
     )
     p.add_argument("--summaries", type=Path, help="write system_summaries.json")
-    p.add_argument(
-        "--chunk", type=int, default=0, help="queries per summaries file (0: one file)"
-    )
     p = sub.add_parser("score", help="merge per_item.json files into the macro rate")
     p.add_argument("per_item", type=Path, nargs="+", help="later files replace earlier")
     args = parser.parse_args()
     if args.cmd == "run":
         cmd_run(args)
     elif args.cmd == "collect":
-        collect(args.paths, args.summaries, args.chunk)
+        collect(args.paths, args.summaries)
     else:
         score(args.per_item)
 
