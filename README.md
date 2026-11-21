@@ -209,7 +209,7 @@ this repository's license. See [NOTICE](NOTICE) for details.
 ## Harbor parity (fork only)
 
 This fork adds `harbor_parity/` for the parity experiment of the
-[Harbor FrontierFinance adapter](https://github.com/harbor-index/adapters/tree/main/src/frontier-finance).
+[Harbor FrontierFinance adapter](https://github.com/harbor-index/adapters/pull/16).
 The grader is unchanged from upstream `8b71342`. Upstream ships no agent, so the original
 side runs `claude-code` outside Harbor with the same version, model, flags,
 environment variables, instruction text and time limit as Harbor's
