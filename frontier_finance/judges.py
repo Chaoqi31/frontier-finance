@@ -151,9 +151,10 @@ class OpenAIJudge(Judge):
         # Pin temperature=0 for deterministic judging on gpt-* chat models. The
         # o* reasoning models and GPT-6+ 400 on any temperature != 1, so it's
         # omitted there.
-        m = _GPT_MAJOR_RE.match(self.model)
-        if m and int(m.group(1)) < 6:
-            kwargs["temperature"] = 0
+        if self.model.startswith("gpt-"):
+            m = _GPT_MAJOR_RE.match(self.model)
+            if not m or int(m.group(1)) < 6:
+                kwargs["temperature"] = 0
         response = self._client.chat.completions.create(
             model=self.model,
             messages=[
@@ -202,7 +203,8 @@ class GeminiJudge(Judge):
         try:
             return self._generate(system, user, "MINIMAL")
         except genai_errors.ClientError as e:
-            if "thinking level is unsupported" not in str(e).lower():
+            message = str(e).lower()
+            if "thinking level" not in message or "unsupported" not in message:
                 raise
             self._minimal_unsupported = True
             return self._generate(system, user, "LOW")

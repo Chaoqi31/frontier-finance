@@ -53,7 +53,13 @@ class _Recorder:
 
 @pytest.mark.parametrize(
     "model, has_temperature",
-    [("gpt-5.4", True), ("gpt-5.6-luna", True), ("gpt-6-luna", False), ("o3", False)],
+    [
+        ("gpt-5.4", True),
+        ("gpt-5.6-luna", True),
+        ("gpt-oss-120b", True),
+        ("gpt-6-luna", False),
+        ("o3", False),
+    ],
 )
 def test_openai_temperature(monkeypatch, model, has_temperature):
     from types import SimpleNamespace
