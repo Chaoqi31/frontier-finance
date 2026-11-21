@@ -16,10 +16,10 @@
 Usage (from the repository root). ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN for a
 bearer-auth gateway, and an optional ANTHROPIC_BASE_URL come from the environment;
 --backend modal also needs the modal package and a Modal login; --backend daytona
-needs the daytona package (<2, the API Harbor 0.26.0 uses) and DAYTONA_API_KEY:
+needs the daytona package (<1, as Harbor 0.27.0 pins it) and DAYTONA_API_KEY:
 
   python harbor_parity/run_claude_code.py run -d <harbor>/datasets/frontier-finance \\
-      -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.326 -n 8
+      -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.330 -n 8
   python harbor_parity/run_claude_code.py collect runs/original1 \\
       --summaries runs/original1/system_summaries.json
 
@@ -50,7 +50,7 @@ from pathlib import Path
 # (an API error, error_during_execution, no result event) is an infrastructure
 # failure and is rerun.
 FINAL_STATUSES = frozenset({"success", "error_max_turns", "timeout"})
-# Set to the model when a base URL is set (harbor 0.26.0, claude_code.py _model_alias_env).
+# Set to the model when a base URL is set (harbor 0.27.0, claude_code.py _model_alias_env).
 ALIAS_VARS = (
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -115,7 +115,7 @@ def dataset_tasks(dataset: Path) -> dict[str, Task]:
 
 
 def agent_env(model: str) -> dict[str, str]:
-    """The variables Harbor's claude-code agent sets (harbor 0.26.0, claude_code.py run()), plus the keys."""
+    """The variables Harbor's claude-code agent sets (harbor 0.27.0, claude_code.py run()), plus the keys."""
     env = {
         "ANTHROPIC_MODEL": model,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",

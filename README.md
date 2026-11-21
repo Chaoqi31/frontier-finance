@@ -221,7 +221,7 @@ environment variables, instruction text and time limit as Harbor's
 
 - `harbor_parity/run_claude_code.py run` reads the Harbor-generated tasks and runs one
   fresh container per query: local Docker, a Modal sandbox (`--backend modal`) or a
-  Daytona sandbox (`--backend daytona`, needs `daytona<2` and `DAYTONA_API_KEY`).
+  Daytona sandbox (`--backend daytona`, needs `daytona<1`, as Harbor 0.27.0 pins it, and `DAYTONA_API_KEY`).
   The image is the task's own `environment/Dockerfile` plus Harbor's `claude-code`
   install step. Each run gets the task's CPU, memory and time limits and the
   instruction on stdin, and keeps `/app/report.md`, the `stream-json` log and the
@@ -243,7 +243,7 @@ environment variables, instruction text and time limit as Harbor's
 ```bash
 export ANTHROPIC_API_KEY=... ANTHROPIC_BASE_URL=...   # the parity gateway
 python harbor_parity/run_claude_code.py run -d <adapters>/datasets/frontier-finance-parity \
-    -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.326 -n 8 \
+    -o runs/original1 -m claude-haiku-5-5 --claude-code-version 2.1.330 -n 8 \
     --backend daytona
 python harbor_parity/run_claude_code.py collect runs/original1 \
     --summaries runs/original1/system_summaries.json
